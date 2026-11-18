@@ -36,7 +36,18 @@
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { 
+      getAuth, 
+      signInAnonymously, 
+      signInWithCustomToken, 
+      onAuthStateChanged, 
+      GoogleAuthProvider, 
+      signInWithPopup, 
+      signOut,
+      setPersistence,
+      browserLocalPersistence,
+      inMemoryPersistence
+    } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
     import { getFirestore, doc, getDoc, setDoc, deleteDoc, updateDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
     const defaultFirebaseConfig = {
@@ -65,7 +76,10 @@
       window.firebaseDb = db;
       window.firebaseAppId = appId;
       window.firebaseImports = {
-        doc, getDoc, setDoc, deleteDoc, updateDoc, onSnapshot, collection, signInAnonymously, signInWithCustomToken, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut
+        doc, getDoc, setDoc, deleteDoc, updateDoc, onSnapshot, collection, 
+        signInAnonymously, signInWithCustomToken, onAuthStateChanged, 
+        GoogleAuthProvider, signInWithPopup, signOut,
+        setPersistence, browserLocalPersistence, inMemoryPersistence
       };
       window.firebaseReady = true;
     } catch (e) {
@@ -255,16 +269,36 @@
       }, [darkMode]);
 
       const getLocalItems = () => {
-        const saved = localStorage.getItem('jw_local_items_fallback');
-        return saved ? JSON.parse(saved) : initialItems;
+        try {
+          const saved = localStorage.getItem('jw_local_items_fallback');
+          return saved ? JSON.parse(saved) : initialItems;
+        } catch (e) {
+          return initialItems;
+        }
       };
 
       const saveLocalItems = (newItems) => {
-        localStorage.setItem('jw_local_items_fallback', JSON.stringify(newItems));
+        try {
+          localStorage.setItem('jw_local_items_fallback', JSON.stringify(newItems));
+        } catch (e) {
+          console.warn("로컬 스토리지 저장 실패:", e);
+        }
       };
 
+      // [수정됨] 모바일 브라우저 IndexedDB 잠금 및 무한 로딩 방지 인증 초기화 로직
       useEffect(() => {
         let isMounted = true;
+        let authResolved = false;
+
+        // 4초 안전 타임아웃: 모바일 IndexedDB 잠금 등으로 인증이 응답하지 않을 경우 무한 로딩 방지
+        const authTimeoutId = setTimeout(() => {
+          if (isMounted && !authResolved) {
+            console.warn("Firebase 인증 응답 지연(4초 초과) - 로컬 폴백 모드로 전환합니다.");
+            setIsFallbackMode(true);
+            setItems(getLocalItems());
+            setLoading(false);
+          }
+        }, 4000);
         
         const initFirebaseAndAuth = async () => {
           let attempts = 0;
@@ -274,6 +308,7 @@
           }
 
           if (!window.firebaseReady || !window.firebaseAuth) {
+            clearTimeout(authTimeoutId);
             if (isMounted) {
               setIsFallbackMode(true);
               setItems(getLocalItems());
@@ -284,7 +319,28 @@
           }
 
           const auth = window.firebaseAuth;
-          const { signInAnonymously, onAuthStateChanged } = window.firebaseImports;
+          const { 
+            signInAnonymously, 
+            onAuthStateChanged, 
+            setPersistence, 
+            browserLocalPersistence, 
+            inMemoryPersistence 
+          } = window.firebaseImports;
+
+          // 모바일 브라우저 IndexedDB 충돌 방지: 실패 시 inMemoryPersistence로 자동 폴백
+          try {
+            await Promise.race([
+              setPersistence(auth, browserLocalPersistence),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Persistence timeout")), 2000))
+            ]);
+          } catch (persistenceErr) {
+            console.warn("로컬 지속성 설정 실패(모바일 스토리지 제한 가능성), 메모리 지속성으로 전환:", persistenceErr);
+            try {
+              await setPersistence(auth, inMemoryPersistence);
+            } catch (memErr) {
+              console.error("메모리 지속성 전환 실패:", memErr);
+            }
+          }
 
           const unsubscribe = onAuthStateChanged(auth, async (currUser) => {
             if (!currUser) {
@@ -292,9 +348,17 @@
                 await signInAnonymously(auth);
               } catch (error) {
                 console.error("익명 로그인 실패:", error);
-                if (isMounted) setIsFallbackMode(true);
+                clearTimeout(authTimeoutId);
+                authResolved = true;
+                if (isMounted) {
+                  setIsFallbackMode(true);
+                  setItems(getLocalItems());
+                  setLoading(false);
+                }
               }
             } else {
+              clearTimeout(authTimeoutId);
+              authResolved = true;
               if (isMounted) {
                 setUser(currUser);
                 if (!currUser.isAnonymous && currUser.email) {
@@ -317,14 +381,28 @@
 
         return () => {
           isMounted = false;
+          clearTimeout(authTimeoutId);
           if (firebaseUnsubscribe) firebaseUnsubscribe();
         };
       }, []);
 
+      // [수정됨] Firestore 실시간 구독 및 타임아웃 안전장치
       useEffect(() => {
         if (!user || isFallbackMode || !window.firebaseReady) return;
 
         setLoading(true);
+        let snapshotReceived = false;
+
+        // Firestore 첫 응답이 5초 이상 지연되면 무한 로딩 방지
+        const dbTimeoutId = setTimeout(() => {
+          if (!snapshotReceived) {
+            console.warn("Firestore 응답 지연(5초 초과) - 로컬 데이터 표시");
+            setIsFallbackMode(true);
+            setItems(getLocalItems());
+            setLoading(false);
+          }
+        }, 5000);
+
         const db = window.firebaseDb;
         const appId = window.firebaseAppId;
         const { collection, onSnapshot } = window.firebaseImports;
@@ -334,6 +412,9 @@
         const unsubscribe = onSnapshot(
           collectionRef,
           (snapshot) => {
+            snapshotReceived = true;
+            clearTimeout(dbTimeoutId);
+
             const fetched = [];
             snapshot.forEach((doc) => {
               fetched.push({ id: doc.id, ...doc.data() });
@@ -346,6 +427,8 @@
             setLoading(false);
           },
           (error) => {
+            snapshotReceived = true;
+            clearTimeout(dbTimeoutId);
             console.error("Firestore 데이터 불러오기 실패:", error);
             setIsFallbackMode(true);
             setItems(getLocalItems());
@@ -353,7 +436,10 @@
           }
         );
 
-        return () => unsubscribe();
+        return () => {
+          clearTimeout(dbTimeoutId);
+          unsubscribe();
+        };
       }, [user, isFallbackMode]);
 
       const handleGoogleLogin = async () => {
@@ -588,7 +674,7 @@
         if (activeTab !== 'all' && item.type !== activeTab) return false;
         if (selectedCategory !== 'all' && item.category !== selectedCategory) return false;
         if (statusFilter === 'active' && item.status !== 'active') return false;
-        if (statusFilter === 'resolved' && item.status !== 'resolved') return false;
+        if (statusFilter === 'resolved' && item.status === 'resolved') return false;
         
         if (searchQuery.trim() !== '') {
           const q = searchQuery.toLowerCase();
@@ -915,7 +1001,7 @@
             )}
           </main>
 
-          {/* 배치도 모달 (컴퓨터에서 한눈에 보이도록 축소된 사이즈 조정 및 좌우 넘침 방지) */}
+          {/* 배치도 모달 */}
           {isMapOpen && (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm z-[60] overflow-hidden">
               <div className={`w-full max-w-2xl rounded-2xl shadow-2xl flex flex-col overflow-hidden border transition-all ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-200'}`}>
@@ -946,7 +1032,7 @@
             </div>
           )}
 
-          {/* 신규 등록 모달 (모바일 환경 좌우 넘침 완벽 방지: max-w-full 및 box-border 적용) */}
+          {/* 신규 등록 모달 */}
           {isRegisterOpen && (
             <div className="fixed inset-0 z-50 overflow-y-auto overflow-x-hidden flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
               <div className={`w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden border transition-all box-border ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-200'}`}>
