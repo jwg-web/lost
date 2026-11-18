@@ -195,6 +195,7 @@
       const [loading, setLoading] = useState(true);
       const [isSyncing, setIsSyncing] = useState(false);
       const [isFallbackMode, setIsFallbackMode] = useState(false);
+      const [retryToken, setRetryToken] = useState(0);
 
       const [activeTab, setActiveTab] = useState('all');
       const [selectedCategory, setSelectedCategory] = useState('all');
@@ -285,20 +286,19 @@
         }
       };
 
-      // [수정됨] 모바일 브라우저 IndexedDB 잠금 및 무한 로딩 방지 인증 초기화 로직
+      // [수정됨] 타임아웃을 10초로 넉넉하게 연장하여 일시적 네트워크 지연으로 인한 오작동 방지
       useEffect(() => {
         let isMounted = true;
         let authResolved = false;
 
-        // 4초 안전 타임아웃: 모바일 IndexedDB 잠금 등으로 인증이 응답하지 않을 경우 무한 로딩 방지
         const authTimeoutId = setTimeout(() => {
           if (isMounted && !authResolved) {
-            console.warn("Firebase 인증 응답 지연(4초 초과) - 로컬 폴백 모드로 전환합니다.");
+            console.warn("Firebase 인증 응답 지연(10초 초과) - 로컬 폴백 모드로 전환합니다.");
             setIsFallbackMode(true);
             setItems(getLocalItems());
             setLoading(false);
           }
-        }, 4000);
+        }, 10000); // 10초로 연장
         
         const initFirebaseAndAuth = async () => {
           let attempts = 0;
@@ -313,7 +313,6 @@
               setIsFallbackMode(true);
               setItems(getLocalItems());
               setLoading(false);
-              showToast("실시간 DB 연동을 시작할 수 없어 로컬 모드로 전환합니다.", "error");
             }
             return;
           }
@@ -327,19 +326,15 @@
             inMemoryPersistence 
           } = window.firebaseImports;
 
-          // 모바일 브라우저 IndexedDB 충돌 방지: 실패 시 inMemoryPersistence로 자동 폴백
           try {
             await Promise.race([
               setPersistence(auth, browserLocalPersistence),
-              new Promise((_, reject) => setTimeout(() => reject(new Error("Persistence timeout")), 2000))
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Persistence timeout")), 3000))
             ]);
           } catch (persistenceErr) {
-            console.warn("로컬 지속성 설정 실패(모바일 스토리지 제한 가능성), 메모리 지속성으로 전환:", persistenceErr);
             try {
               await setPersistence(auth, inMemoryPersistence);
-            } catch (memErr) {
-              console.error("메모리 지속성 전환 실패:", memErr);
-            }
+            } catch (memErr) {}
           }
 
           const unsubscribe = onAuthStateChanged(auth, async (currUser) => {
@@ -347,7 +342,6 @@
               try {
                 await signInAnonymously(auth);
               } catch (error) {
-                console.error("익명 로그인 실패:", error);
                 clearTimeout(authTimeoutId);
                 authResolved = true;
                 if (isMounted) {
@@ -384,24 +378,23 @@
           clearTimeout(authTimeoutId);
           if (firebaseUnsubscribe) firebaseUnsubscribe();
         };
-      }, []);
+      }, [retryToken]);
 
-      // [수정됨] Firestore 실시간 구독 및 타임아웃 안전장치
+      // [수정됨] Firestore 데이터 수신 타임아웃 10초로 연장
       useEffect(() => {
         if (!user || isFallbackMode || !window.firebaseReady) return;
 
         setLoading(true);
         let snapshotReceived = false;
 
-        // Firestore 첫 응답이 5초 이상 지연되면 무한 로딩 방지
         const dbTimeoutId = setTimeout(() => {
           if (!snapshotReceived) {
-            console.warn("Firestore 응답 지연(5초 초과) - 로컬 데이터 표시");
+            console.warn("Firestore 응답 지연(10초 초과) - 로컬 데이터 표시");
             setIsFallbackMode(true);
             setItems(getLocalItems());
             setLoading(false);
           }
-        }, 5000);
+        }, 10000); // 10초로 연장
 
         const db = window.firebaseDb;
         const appId = window.firebaseAppId;
@@ -440,7 +433,14 @@
           clearTimeout(dbTimeoutId);
           unsubscribe();
         };
-      }, [user, isFallbackMode]);
+      }, [user, isFallbackMode, retryToken]);
+
+      const handleReconnect = () => {
+        setLoading(true);
+        setIsFallbackMode(false);
+        setRetryToken(prev => prev + 1);
+        showToast('서버 재연결을 시도합니다...', 'info');
+      };
 
       const handleGoogleLogin = async () => {
         if (!window.firebaseReady) {
@@ -760,9 +760,16 @@
             </div>
           </header>
 
+          {/* [수정됨] 재연결 버튼이 포함된 폴백 안내 바 */}
           {isFallbackMode && (
-            <div className="bg-amber-500/10 border-b border-amber-500/20 text-amber-800 dark:text-amber-400 px-4 py-2.5 text-xs text-center font-medium">
-              ⚠️ <strong>안내:</strong> 실시간 통신 상태가 지연되어 기기 내부 로컬 데이터로 대체 가동 중입니다.
+            <div className="bg-amber-500/10 border-b border-amber-500/20 text-amber-800 dark:text-amber-400 px-4 py-2.5 text-xs text-center font-medium flex items-center justify-center space-x-3">
+              <span>⚠️ <strong>안내:</strong> 실시간 통신 상태가 지연되어 기기 내부 로컬 데이터로 대체 가동 중입니다.</span>
+              <button 
+                onClick={handleReconnect}
+                className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded shadow-sm transition"
+              >
+                서버 다시 연결
+              </button>
             </div>
           )}
 
